@@ -1,0 +1,728 @@
+// ==UserScript==
+// @name         辽宁固废平台-产生台账自动填写(移动端优化)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  专为移动端浏览器优化，自动填写危险废物产生台账表单，支持废物俗称弹窗选择、下拉框、单选框全自动填写
+// @author       You
+// @match        https://gtfwgl.lnsthj.cn/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ============================================================
+    // 【第一部分：配置区】
+    // ============================================================
+    const WASTE_CONFIG = {
+        "水泥窑": {
+            "废物俗称": "替代燃料",
+            "运送部门经办人": "张晓强",
+            "包装数量": "1",
+            "车辆描述": "整车过磅",
+            "包装类型": "散装",
+            "去向": "贮存",
+            "容器材质": "其他",
+            "容器容量": "其他"
+        },
+        "铁球和铁屑": {
+            "废物俗称": "焚烧废金属",
+            "运送部门经办人": "张晓强",
+            "包装数量": "1",
+            "车辆描述": "整车过磅",
+            "包装类型": "散装",
+            "去向": "贮存",
+            "容器材质": "其他",
+            "容器容量": "其他"
+        },
+        "炉渣飞灰清理渣": {
+            "废物俗称": "炉渣",
+            "运送部门经办人": "孙凯",
+            "包装数量": "1",
+            "车辆描述": "整车过磅",
+            "包装类型": "散装",
+            "去向": "贮存",
+            "容器材质": "其他",
+            "容器容量": "其他"
+        }
+    };
+
+    // ============================================================
+    // 【第二部分：工具函数】
+    // ============================================================
+
+    // 等待元素出现
+    function waitForElement(selector, timeout = 10000) {
+        return new Promise((resolve, reject) => {
+            const el = document.querySelector(selector);
+            if (el) { resolve(el); return; }
+            
+            const observer = new MutationObserver(() => {
+                const el = document.querySelector(selector);
+                if (el) { 
+                    observer.disconnect(); 
+                    resolve(el); 
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            
+            setTimeout(() => { 
+                observer.disconnect(); 
+                reject(new Error(`等待元素超时: ${selector}`)); 
+            }, timeout);
+        });
+    }
+
+    // 简单延时
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // 查找表单项内容区域
+    function findFormItemByLabel(labelText) {
+        if (Array.isArray(labelText)) {
+            for (const text of labelText) {
+                const result = findFormItemByLabel(text);
+                if (result) return result;
+            }
+            return null;
+        }
+        if (!labelText) return null;
+        
+        // 清理标签文本，去除冒号
+        const cleanLabel = labelText.trim().replace(/[：:]\s*$/, '');
+        const labels = document.querySelectorAll('.el-form-item__label');
+
+        // 精确匹配
+        for (const label of labels) {
+            const text = label.textContent.trim().replace(/[：:]\s*$/, '');
+            if (text === cleanLabel) {
+                const formItem = label.closest('.el-form-item');
+                if (formItem) return formItem.querySelector('.el-form-item__content');
+            }
+        }
+        // 模糊匹配
+        for (const label of labels) {
+            const text = label.textContent.trim().replace(/[：:]\s*$/, '');
+            if (text.includes(cleanLabel) || cleanLabel.includes(text)) {
+                const formItem = label.closest('.el-form-item');
+                if (formItem) return formItem.querySelector('.el-form-item__content');
+            }
+        }
+        return null;
+    }
+
+    // 填充输入框
+    function fillInput(contentEl, value) {
+        if (!contentEl || value === undefined || value === null) return;
+        const input = contentEl.querySelector('input.el-input__inner, input[type="text"], input[type="number"], textarea');
+        if (!input) return;
+        
+        // 如果输入框有值且非禁用，可能需要先清空或直接覆盖，视具体业务逻辑而定，这里直接覆盖
+        input.focus();
+        // 移动端可能需要点击触发键盘或焦点
+        input.click();
+        
+        // 设置值
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeInputValueSetter.call(input, value);
+        
+        // 触发事件
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.blur();
+    }
+
+    // 选择下拉框
+    async function selectDropdown(contentEl, optionText) {
+        if (!contentEl || !optionText) return;
+        const selectWrapper = contentEl.querySelector('.el-select');
+        if (!selectWrapper) { 
+            console.warn('[自动填写] 未找到 el-select 容器'); 
+            return; 
+        }
+
+        // 尝试通过 Vue 实例操作（如果可用）
+        if (selectWrapper.__vue__) {
+            try {
+                const vueSelect = selectWrapper.__vue__;
+                // 打开菜单
+                if (!vueSelect.visible) { 
+                    vueSelect.toggleMenu(); 
+                    await sleep(400); 
+                }
+                
+                // 查找选项
+                let found = false;
+                // 多次尝试获取 options，因为异步加载
+                for (let i = 0; i < 5; i++) {
+                    const options = vueSelect.options || [];
+                    const target = options.find(opt => {
+                        const label = opt.currentLabel || opt.label || '';
+                        return label === optionText;
+                    });
+                    
+                    if (target) {
+                        vueSelect.handleOptionSelect(target);
+                        vueSelect.visible = false;
+                        found = true;
+                        console.log(`[自动填写] ✓ Vue方式选中: ${optionText}`);
+                        break;
+                    }
+                    await sleep(200);
+                }
+                if(found) return;
+            } catch (e) { 
+                console.warn('[自动填写] Vue操作失败，尝试DOM模拟', e); 
+            }
+        }
+
+        // DOM 模拟方式
+        const input = selectWrapper.querySelector('.el-input__inner');
+        if (input) { 
+            input.scrollIntoView({ behavior: 'instant', block: 'center' }); 
+            input.click(); 
+            input.focus(); 
+        }
+        await sleep(600);
+
+        let clicked = false;
+        // 尝试点击下拉项
+        const tryClickDropdownItem = () => {
+            // 查找所有可见的下拉菜单
+            const dropdowns = document.querySelectorAll('.el-select-dropdown');
+            for (const dropdown of dropdowns) {
+                // 检查是否可见
+                const style = window.getComputedStyle(dropdown);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                
+                const items = dropdown.querySelectorAll('.el-select-dropdown__item');
+                for (const item of items) {
+                    const text = item.textContent ? item.textContent.trim() : '';
+                    // 兼容 span 包裹的情况
+                    const spanText = item.querySelector('span') ? item.querySelector('span').textContent.trim() : '';
+                    const finalText = spanText || text;
+                    
+                    if (finalText === optionText) {
+                        // 模拟完整点击序列
+                        item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                        item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                        item.click();
+                        clicked = true;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        for (let i = 0; i < 8; i++) { 
+            if (tryClickDropdownItem()) break; 
+            await sleep(250); 
+        }
+        
+        if (clicked) { 
+            console.log(`[自动填写] ✓ 点击选中: ${optionText}`); 
+            await sleep(200); 
+        } else { 
+            console.warn(`[自动填写] ✗ 未找到选项: ${optionText}`); 
+        }
+    }
+
+    // 选择单选框
+    function selectRadioByValue(contentEl, value) {
+        if (!contentEl) return;
+        const radios = contentEl.querySelectorAll('.el-radio__original');
+        for (const radio of radios) {
+            if (radio.value === String(value)) { 
+                radio.click(); 
+                radio.dispatchEvent(new Event('change', { bubbles: true })); 
+                return; 
+            }
+        }
+        // 兜底：如果没有 value 属性匹配，尝试通过文本或索引（此处简化处理，仅依赖 value）
+    }
+
+    // ============================================================
+    // 【第三部分：核心增强 - 弹窗选择废物俗称】
+    // ============================================================
+
+    async function selectWasteName(wasteName) {
+        if (!wasteName) return;
+        console.log(`[自动填写] 开始选择废物俗称: ${wasteName}`);
+
+        // 1. 寻找“废物俗称”标签
+        const labels = Array.from(document.querySelectorAll('.el-form-item__label'));
+        const targetLabel = labels.find(l => {
+            const t = l.textContent.trim().replace(/[：:]\s*$/, '');
+            return t === '废物俗称';
+        });
+
+        if (!targetLabel) { 
+            console.warn('[自动填写] 未找到"废物俗称"标签'); 
+            return; 
+        }
+
+        const formItem = targetLabel.closest('.el-form-item');
+        if (!formItem) { 
+            console.warn('[自动填写] 未找到"废物俗称"表单项'); 
+            return; 
+        }
+
+        // 2. 寻找“选择”按钮
+        let selectBtn = null;
+        const buttons = formItem.querySelectorAll('button');
+        for (const btn of buttons) {
+            if (btn.textContent.trim() === '选择') { 
+                selectBtn = btn; 
+                break; 
+            }
+        }
+        
+        // 兜底查找
+        if (!selectBtn) {
+             const allBtns = formItem.querySelectorAll('button');
+             for(const btn of allBtns) {
+                 if(btn.innerText.indexOf('选择') !== -1) {
+                     selectBtn = btn;
+                     break;
+                 }
+             }
+        }
+
+        if (!selectBtn) { 
+            console.warn('[自动填写] 未找到"选择"按钮'); 
+            return; 
+        }
+
+        // 3. 点击按钮
+        selectBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        selectBtn.click();
+        console.log('[自动填写] 已点击"选择"按钮');
+        await sleep(1200);
+
+        // 4. 等待弹窗
+        let dialogWrapper = null;
+        for (let i = 0; i < 20; i++) {
+            // ElementUI 弹窗结构
+            const wrappers = document.querySelectorAll('.el-dialog__wrapper');
+            for (const w of wrappers) {
+                // 检查是否包含特定标题或类名，且未隐藏
+                if (w.style.display !== 'none' && getComputedStyle(w).display !== 'none') {
+                    const dialog = w.querySelector('.el-dialog');
+                    if (dialog) {
+                         // 简单判断：如果有表格或者搜索框，大概率是目标弹窗
+                         if (dialog.querySelector('.el-table') || dialog.querySelector('input[placeholder*="名称"]')) {
+                             dialogWrapper = w;
+                             break;
+                         }
+                    }
+                }
+            }
+            if (dialogWrapper) break;
+            await sleep(200);
+        }
+
+        if (!dialogWrapper) { 
+            console.warn('[自动填写] "选择废物"弹窗未出现或无法识别'); 
+            return; 
+        }
+
+        const dialog = dialogWrapper.querySelector('.el-dialog');
+        await sleep(600);
+
+        // 5. 搜索关键词
+        const searchInputs = dialog.querySelectorAll('input.el-input__inner');
+        let searched = false;
+        for (const input of searchInputs) {
+            const ph = input.getAttribute('placeholder') || '';
+            if (ph.includes('名称') || ph.includes('搜索') || ph.includes('输入') || ph.includes('废物')) {
+                input.focus();
+                // 使用原生 setter 绕过 Vue 监听限制
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                nativeInputValueSetter.call(input, wasteName);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                
+                await sleep(400);
+                
+                // 点击查询按钮
+                const queryBtn = dialog.querySelector('button.el-button--primary');
+                if (queryBtn && (queryBtn.textContent.includes('查询') || queryBtn.textContent.includes('搜索'))) {
+                    queryBtn.click();
+                } else {
+                    // 尝试回车
+                    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                }
+                searched = true;
+                await sleep(800); // 等待搜索结果
+                break;
+            }
+        }
+
+        // 6. 在表格中查找并选择
+        let found = false;
+        let pageAttempts = 0;
+        const maxPages = 5;
+
+        while (!found && pageAttempts < maxPages) {
+            // 获取表格行
+            const rows = dialogWrapper.querySelectorAll('.el-table__body-wrapper .el-table__row');
+            console.log(`[自动填写] 第${pageAttempts + 1}页找到 ${rows.length} 行`);
+
+            for (const row of rows) {
+                if (row.textContent.includes(wasteName)) {
+                    console.log(`[自动填写] 找到目标行: ${wasteName}`);
+                    // 尝试点击行内的按钮或单选框
+                    const radio = row.querySelector('.el-radio__original');
+                    const btn = row.querySelector('button');
+                    
+                    if (radio) {
+                        radio.click();
+                    } else if (btn) {
+                        btn.click();
+                    } else {
+                        // 点击整行
+                        row.click();
+                    }
+                    found = true; 
+                    break;
+                }
+            }
+
+            if (!found) {
+                // 尝试翻页
+                const nextBtn = dialogWrapper.querySelector('.el-pagination .btn-next:not(.disabled):not([disabled])');
+                if (nextBtn) { 
+                    nextBtn.click(); 
+                    await sleep(1200); 
+                    pageAttempts++; 
+                } else { 
+                    console.warn('[自动填写] 已到最后一页或未找到翻页按钮'); 
+                    break; 
+                }
+            }
+        }
+
+        if (!found) {
+            console.warn(`[自动填写] 未找到"${wasteName}"，请手动选择`);
+            // 不关闭弹窗，让用户手动选
+        } else {
+            // 等待弹窗自动关闭或手动关闭
+            // 有些系统选择后会自动关闭，有些需要点击确定
+            // 这里假设选择后会自动关闭，如果不关闭，可能需要额外逻辑点击“确定”
+            await sleep(1000);
+            console.log(`[自动填写] ✓ 废物俗称选择操作完成`);
+        }
+    }
+
+
+    // ============================================================
+    // 【第四部分：UI面板 (移动端优化)】
+    // ============================================================
+
+    function createPanel() {
+        if (document.getElementById('auto-fill-panel')) return;
+        
+        // 创建悬浮球
+        const toggleBtn = document.createElement('div');
+        toggleBtn.id = 'auto-fill-toggle';
+        toggleBtn.innerHTML = '📝';
+        toggleBtn.style.cssText = `
+            position: fixed;
+            bottom: 80px;
+            right: 20px;
+            width: 50px;
+            height: 50px;
+            background: #409EFF;
+            color: #fff;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            cursor: pointer;
+            z-index: 99999;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            transition: transform 0.2s;
+        `;
+        toggleBtn.addEventListener('touchstart', function() { this.style.transform = 'scale(0.9)'; });
+        toggleBtn.addEventListener('touchend', function() { 
+            this.style.transform = 'scale(1)'; 
+            const panel = document.getElementById('auto-fill-panel');
+            if (panel) panel.style.display = 'block';
+            this.style.display = 'none';
+        });
+        document.body.appendChild(toggleBtn);
+
+        // 创建主面板
+        const panel = document.createElement('div');
+        panel.id = 'auto-fill-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 90%;
+            max-width: 400px;
+            background: rgba(255, 255, 255, 0.95);
+            border: 1px solid #409EFF;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+            z-index: 100000;
+            font-family: sans-serif;
+            font-size: 14px;
+            display: none;
+            backdrop-filter: blur(5px);
+        `;
+        
+        panel.innerHTML = `
+            <div style="background:#409EFF;color:#fff;padding:12px 15px;border-radius:12px 12px 0 0;font-weight:bold;display:flex;justify-content:space-between;align-items:center;">
+                <span>📝 台账自动填写</span>
+                <span id="panel-close" style="cursor:pointer;font-size:20px;line-height:1;padding:5px;">×</span>
+            </div>
+            <div style="padding:15px;">
+                <div style="margin-bottom:12px;">
+                    <label style="display:block;margin-bottom:5px;color:#333;font-weight:bold;">1. 废物类型：</label>
+                    <select id="waste-type" style="width:100%;padding:10px;border:1px solid #dcdfe6;border-radius:6px;font-size:14px;background:#fff;"></select>
+                </div>
+
+                <div style="margin-bottom:15px;">
+                    <label style="display:block;margin-bottom:5px;color:#333;font-weight:bold;">2. 产生量(吨)：</label>
+                    <input id="produce-amount" type="number" step="0.01" placeholder="请输入数字" style="width:100%;padding:10px;border:1px solid #dcdfe6;border-radius:6px;font-size:14px;box-sizing:border-box;">
+                    <div id="amount-error" style="color:#f56c6c;font-size:12px;margin-top:4px;display:none;">请输入有效数字！</div>
+                </div>
+
+                <button id="btn-auto-fill" style="width:100%;padding:12px;background:#67c23a;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer;font-weight:bold;box-shadow:0 2px 6px rgba(103, 194, 58, 0.3);">🚀 开始自动填写</button>
+
+                <div id="status-msg" style="margin-top:10px;padding:8px;border-radius:6px;font-size:12px;display:none;text-align:center;"></div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // 初始化下拉框
+        const wasteSelect = document.getElementById('waste-type');
+        const wasteNames = Object.keys(WASTE_CONFIG);
+        wasteNames.forEach(name => { 
+            const opt = document.createElement('option'); 
+            opt.value = name; 
+            opt.textContent = name; 
+            wasteSelect.appendChild(opt); 
+        });
+        if (wasteNames.length > 0) wasteSelect.value = wasteNames[0];
+
+        // 关闭按钮
+        document.getElementById('panel-close').addEventListener('click', () => { 
+            panel.style.display = 'none'; 
+            toggleBtn.style.display = 'flex'; 
+        });
+
+        // 输入验证
+        const amountInput = document.getElementById('produce-amount');
+        amountInput.addEventListener('input', function() {
+            const err = document.getElementById('amount-error');
+            if (this.value && !/^\d+(\.\d+)?$/.test(this.value)) { 
+                err.style.display = 'block'; 
+                this.style.borderColor = '#f56c6c'; 
+            } else { 
+                err.style.display = 'none'; 
+                this.style.borderColor = '#dcdfe6'; 
+            }
+        });
+
+        // 执行按钮
+        document.getElementById('btn-auto-fill').addEventListener('click', async () => {
+            const wasteType = wasteSelect.value;
+            const amount = amountInput.value.trim();
+            
+            if (!wasteType) { showStatus('请先选择废物类型！', 'error'); return; }
+            if (!amount || !/^\d+(\.\d+)?$/.test(amount)) { 
+                showStatus('请输入有效的产生量数字！', 'error'); 
+                amountInput.focus(); 
+                return; 
+            }
+            
+            const config = WASTE_CONFIG[wasteType];
+            if (!config) { showStatus('未找到该废物类型的配置！', 'error'); return; }
+            
+            showStatus('正在执行，请勿操作屏幕...', 'info');
+            await runAutoFill(config, amount);
+        });
+    }
+
+    function showStatus(msg, type) {
+        const el = document.getElementById('status-msg');
+        if(!el) return;
+        el.textContent = msg; 
+        el.style.display = 'block';
+        if (type === 'error') { 
+            el.style.background = '#fde2e2'; 
+            el.style.color = '#c45656'; 
+            el.style.border = '1px solid #f56c6c'; 
+        } else if (type === 'success') { 
+            el.style.background = '#e1f3d8'; 
+            el.style.color = '#529b2e'; 
+            el.style.border = '1px solid #67c23a'; 
+        } else { 
+            el.style.background = '#ecf5ff'; 
+            el.style.color = '#409eff'; 
+            el.style.border = '1px solid #409eff'; 
+        }
+    }
+
+    // ============================================================
+    // 【第五部分：核心自动填写逻辑】
+    // ============================================================
+
+    async function runAutoFill(config, amount) {
+        const tagType = "2"; // 假设的值，根据实际需求调整
+        const transportType = "3"; // 假设的值，根据实际需求调整
+
+        try {
+            // 1. 点击添加按钮
+            let targetBtn = null;
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) { 
+                if (btn.textContent.includes('添加产生台账')) { 
+                    targetBtn = btn; 
+                    break; 
+                } 
+            }
+            
+            if (!targetBtn) { 
+                // 尝试更宽泛的匹配
+                for (const btn of buttons) {
+                    if (btn.textContent.includes('添加')) {
+                        targetBtn = btn;
+                        break;
+                    }
+                }
+            }
+
+            if (!targetBtn) { 
+                showStatus('未找到"添加产生台账"按钮，请确保在正确页面', 'error'); 
+                return; 
+            }
+            
+            targetBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            targetBtn.click();
+            showStatus('已点击添加，等待弹窗...', 'info');
+            await sleep(1500);
+
+            // 2. 获取弹窗主体
+            // 移动端弹窗可能在 body 下，也可能在特定容器下
+            const dialogBody = document.querySelector('.el-dialog__body') || document.body;
+            
+            // 3. 选择单选框 (标签类型, 运输方式等)
+            // 注意：这些选择器依赖于具体的 HTML 结构，如果页面更新可能需要调整
+            selectRadioByValue(dialogBody, tagType);
+            await sleep(500);
+            selectRadioByValue(dialogBody, transportType);
+            await sleep(500);
+
+            // 4. 选择废物俗称 (弹窗交互)
+            if (config['废物俗称']) {
+                showStatus('正在选择废物俗称...', 'info');
+                await selectWasteName(config['废物俗称']);
+                await sleep(1000); // 等待弹窗关闭和数据回填
+            }
+
+            // 5. 选择去向
+            showStatus('正在选择去向...', 'info');
+            const quxiangEl = findFormItemByLabel('去向');
+            if (quxiangEl) await selectDropdown(quxiangEl, config['去向'] || '贮存');
+            await sleep(800);
+
+            // 6. 填写经办人
+            const operatorName = config['运送部门经办人'];
+            if (operatorName) {
+                let opEl = findFormItemByLabel(['运送部门经办人', '产生部门经办人']);
+                if (!opEl) {
+                    // 兜底：通过 placeholder 查找
+                    const inputs = document.querySelectorAll('.el-dialog__body input[placeholder*="经办人"]');
+                    if (inputs.length > 0) opEl = inputs[0].closest('.el-form-item')?.querySelector('.el-form-item__content');
+                }
+                if (opEl) { 
+                    fillInput(opEl, operatorName); 
+                    await sleep(300); 
+                }
+            }
+
+            // 7. 其他下拉框
+            showStatus('正在填写其他选项...', 'info');
+            const dropdownFields = [
+                { label: '包装类型', value: config['包装类型'] || '散装' },
+                { label: '容器材质', value: config['容器材质'] || '其他' },
+                { label: '容器容量', value: config['容器容量'] || '其他' }
+            ];
+            for (const field of dropdownFields) {
+                const el = findFormItemByLabel(field.label);
+                if (el) await selectDropdown(el, field.value);
+                await sleep(300);
+            }
+
+            // 8. 填写产生量
+            const amountContent = findFormItemByLabel('产生量');
+            if (amountContent) fillInput(amountContent, amount);
+            else { 
+                // 尝试其他可能的标签
+                for (const alt of ['数量', '重量', '产生数量']) { 
+                    const el = findFormItemByLabel(alt); 
+                    if (el) { 
+                        fillInput(el, amount); 
+                        break; 
+                    } 
+                } 
+            }
+            await sleep(300);
+
+            // 9. 包装数量和车辆描述
+            const pkgContent = findFormItemByLabel('包装数量');
+            if (pkgContent) { 
+                const input = pkgContent.querySelector('input'); 
+                if (!input || !input.value) fillInput(pkgContent, config['包装数量'] || '1'); 
+            }
+            
+            const carContent = findFormItemByLabel('车辆描述');
+            if (carContent) fillInput(carContent, config['车辆描述'] || '整车过磅');
+
+            // 10. 完成
+            showStatus('✅ 表单填写完成！请检查并保存。', 'success');
+            
+            // 清空输入框以便下次使用
+            const amountInput = document.getElementById('produce-amount');
+            if (amountInput) {
+                amountInput.value = '';
+            }
+
+        } catch (err) {
+            console.error('自动填写出错:', err);
+            showStatus('填写出错: ' + err.message, 'error');
+        }
+    }
+
+    // ============================================================
+    // 【第六部分：初始化】
+    // ============================================================
+
+    // 页面加载完成后创建面板
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', createPanel);
+    } else {
+        createPanel();
+    }
+
+    // 监听 URL 变化 (SPA 应用)
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+        const url = location.href;
+        if (url !== lastUrl) {
+            lastUrl = url;
+            // 如果进入目标页面，确保面板存在
+            if (url.includes('/enterprise/bussaccount/produceInBound')) {
+                setTimeout(createPanel, 1000);
+            }
+        }
+    }).observe(document, { subtree: true, childList: true });
+
+})();
